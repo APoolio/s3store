@@ -1,4 +1,4 @@
-module github.com/aymanbagabas/s3store
+module github.com/APoolio/s3store
 
 go 1.17
 
