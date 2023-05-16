@@ -17,6 +17,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	cm "github.com/caddyserver/certmagic"
+	"github.com/rs/zerolog"
+)
+
+const (
+	loadMethod           = "load"
+	existsMethod         = "exists"
+	storeMethod          = "store"
+	deleteMethod         = "delete"
+	listMethod           = "list"
+	statMethod           = "stat"
+	lockMethod           = "lock"
+	createLockFileMethod = "createLockFile"
+	deleteLockFileMethod = "deleteLockFile"
+	method               = "source"
 )
 
 const lockFileExists = "Lock file for already exists"
@@ -43,14 +57,16 @@ type S3Store struct {
 	prefix string
 	bucket *string
 	client *s3.Client
+	log    zerolog.Logger
 }
 
-func NewS3Store(client *s3.Client, bucketName string) *S3Store {
+func NewS3Store(log zerolog.Logger, client *s3.Client, bucketName string) *S3Store {
 
 	store := &S3Store{
 		bucket: aws.String(bucketName),
 		client: client,
 		prefix: "certmagic",
+		log:    log,
 	}
 
 	return store
@@ -84,6 +100,8 @@ func (s *S3Store) Exists(ctx context.Context, key string) bool {
 	if err == nil {
 		return true
 	}
+	s.log.Error().Err(err).Str(method, existsMethod).Msgf("key does not exist in s3 (%s)", key)
+
 	var nsk *types.NoSuchKey
 	return !errors.As(err, &nsk)
 }
@@ -99,6 +117,7 @@ func (s *S3Store) Store(ctx context.Context, key string, value []byte) error {
 	_, err := s.client.PutObject(ctx, input)
 
 	if err != nil {
+		s.log.Error().Err(err).Str(method, storeMethod).Msg("error encountered calling putObject to s3")
 		return err
 	}
 	return nil
@@ -112,11 +131,13 @@ func (s *S3Store) Load(ctx context.Context, key string) ([]byte, error) {
 	}
 	result, err := s.client.GetObject(ctx, input)
 	if err != nil {
+		s.log.Error().Err(err).Str(method, loadMethod).Msgf("failed fetching value from s3 (key: %s)", key)
 		return nil, err
 	}
 
 	b, err := ioutil.ReadAll(result.Body)
 	if err != nil {
+		s.log.Error().Err(err).Str(method, loadMethod).Msg("error encountered reading result")
 		return nil, err
 	}
 	return b, nil
@@ -130,6 +151,7 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	}
 	_, err := s.client.DeleteObject(ctx, input)
 	if err != nil {
+		s.log.Error().Err(err).Str(method, deleteMethod).Msg("error deleting object")
 		return err
 	}
 	return nil
@@ -149,6 +171,7 @@ func (s *S3Store) List(ctx context.Context, prefix string, recursive bool) ([]st
 
 	result, err := s.client.ListObjects(ctx, input)
 	if err != nil {
+		s.log.Error().Err(err).Str(method, listMethod).Msg("error encountered while listing objects in s3")
 		return nil, err
 	}
 	for _, k := range result.Contents {
@@ -201,6 +224,7 @@ func (s *S3Store) Lock(ctx context.Context, key string) error {
 
 		if err.Error() != lockFileExists {
 			// unexpected error
+			s.log.Error().Err(err).Str(method, createLockFileMethod).Msg("unexpected error")
 			fmt.Println(err)
 			return fmt.Errorf("creating lock file: %+v", err)
 
@@ -212,22 +236,30 @@ func (s *S3Store) Lock(ctx context.Context, key string) error {
 		switch {
 		case s.errNoSuchKey(err):
 			// must have just been removed; try again to create it
+			s.log.Error().Err(err).Str(method, statMethod).Msg("no such key")
 			continue
 
 		case err != nil:
 			// unexpected error
-			return fmt.Errorf("accessing lock file: %v", err)
+			lockErr := fmt.Errorf("accessing lock file: %v", err)
+			s.log.Error().Err(lockErr).Str(method, statMethod).Msg("stat err")
+			return lockErr
 
 		case s.fileLockIsStale(info):
 			log.Printf("[INFO][%s] Lock for '%s' is stale; removing then retrying: %s",
 				s, key, lockFile)
-			s.deleteLockFile(ctx, lockFile)
+			deleteErr := s.deleteLockFile(ctx, lockFile)
+			if deleteErr != nil {
+				s.log.Error().Err(deleteErr).Str(method, deleteLockFileMethod).Msg("file lock is stale")
+			}
 			continue
 
 		case time.Since(start) > staleLockDuration*2:
 			// should never happen, hopefully
-			return fmt.Errorf("possible deadlock: %s passed trying to obtain lock for %s",
+			staleLockErr := fmt.Errorf("possible deadlock: %s passed trying to obtain lock for %s",
 				time.Since(start), key)
+			s.log.Error().Err(staleLockErr).Str(method, lockMethod).Msg("stale lock duration")
+			return staleLockErr
 
 		default:
 			// lockfile exists and is not stale;
